@@ -1,0 +1,16 @@
+{
+ "1. P3/P4/P5 shapes @640x640": true,
+ "2. detection output @640x640": true,
+ "1. P3/P4/P5 shapes @224x640": true,
+ "2. detection output @224x640": true,
+ "3. encoder tensors == checkpoint (232)": true,
+ "4. encoder output == ZipDepth (max |diff| 0.0e+00)": true,
+ "5. neck/head not loaded from COCO (0/62 conv weights equal)": true,
+ "5b. adapters: [1, 1, 1] conv layers, 136,192 params": true,
+ "6. gradient flow (encoder 100%, adapters 100%, neck 100%, head 94%)": true,
+ "6b. training step with batch size 1": true,
+ "7. interrupted run saved an unfinished checkpoint": true,
+ "7. resumed run completed all epochs": true,
+ "7. best.pt reloads as ZipDepth model and predicts": true,
+ "8. B-RN learns: train loss -89% box / -88% cls, mAP50 0.23 (A 0.93)": true
+}

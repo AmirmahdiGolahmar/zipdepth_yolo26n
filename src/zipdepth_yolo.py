@@ -2,6 +2,9 @@
 
 Kept in a separate module so that checkpoints (which pickle the model) can be loaded from any notebook,
 provided this file and the ZipDepth repo are on sys.path.
+
+Variants: adapter depth (1 = Run B, 3 = Run B-A3) and neck/head initialisation (COCO = Run B, random = Run B-RN).
+The 1-layer adapter keeps the exact module layout of Run B, so existing Run B checkpoints still load.
 """
 import torch
 import torch.nn as nn
@@ -24,10 +27,24 @@ class SafeBatchNorm2d(nn.BatchNorm2d):
         return super().forward(x)
 
 
-class ZipDepthBackbone(nn.Module):
-    """ImageNet-normalised ZipDepth encoder + 1x1 Conv-BN-SiLU adapters. Input in [0, 1]; returns [P3, P4, P5]."""
+def conv_bn_silu(ci, co, k=1):
+    """Conv(k x k, no bias) + BN + SiLU, flattened into a list so the 1-layer adapter keeps Run B's state_dict keys."""
+    return [nn.Conv2d(ci, co, k, padding=k // 2, bias=False), nn.BatchNorm2d(co), nn.SiLU()]
 
-    def __init__(self, ckpt=None, out_channels=YOLO_OUT_CH):
+
+def make_adapter(ci, co, n_layers=1):
+    """1 layer: 1x1 (Run B). 2 layers: 1x1 -> 3x3. 3 layers: 1x1 -> 3x3 -> 1x1. Channels change in the first layer."""
+    kernels = {1: [1], 2: [1, 3], 3: [1, 3, 1]}[n_layers]
+    layers = []
+    for i, k in enumerate(kernels):
+        layers += conv_bn_silu(ci if i == 0 else co, co, k)
+    return nn.Sequential(*layers)
+
+
+class ZipDepthBackbone(nn.Module):
+    """ImageNet-normalised ZipDepth encoder + Conv-BN-SiLU adapters. Input in [0, 1]; returns [P3, P4, P5]."""
+
+    def __init__(self, ckpt=None, out_channels=YOLO_OUT_CH, adapter_layers=1):
         super().__init__()
         zd = create_model("base", upsample_unfold=True)
         if ckpt is not None:
@@ -39,9 +56,7 @@ class ZipDepthBackbone(nn.Module):
         self.register_buffer("mean", zd.mean.clone())
         self.register_buffer("std", zd.std.clone())
         enc_ch = (self.encoder.stage2[0].out_ch, self.encoder.stage3[0].out_ch, self.encoder.stage4[0].out_ch)
-        self.adapters = nn.ModuleList(
-            nn.Sequential(nn.Conv2d(ci, co, 1, bias=False), nn.BatchNorm2d(co), nn.SiLU())
-            for ci, co in zip(enc_ch, out_channels))
+        self.adapters = nn.ModuleList(make_adapter(ci, co, adapter_layers) for ci, co in zip(enc_ch, out_channels))
 
     def encode(self, x):
         """Raw encoder outputs (s2, s3', s4') at strides 8 / 16 / 32."""
@@ -75,11 +90,12 @@ def _set_meta(m, i, f):
     return m
 
 
-def build_zipdepth_yolo(nc, names, zipdepth_ckpt=None, coco_weights="yolo26n.pt", verbose=False):
-    """YOLO26n (nc classes) with COCO neck/head weights and a ZipDepth backbone.
+def build_zipdepth_yolo(nc, names, zipdepth_ckpt=None, coco_weights="yolo26n.pt", adapter_layers=1, verbose=False):
+    """YOLO26n (nc classes) with a ZipDepth backbone.
 
-    zipdepth_ckpt=None gives a randomly initialised encoder (run C). Layer indices 0-10 are kept:
-    layer 0 = ZipDepthBackbone, layers 4 / 6 / 10 pick P3 / P4 / P5 from it, the rest are placeholders.
+    zipdepth_ckpt=None gives a randomly initialised encoder; coco_weights=None gives a randomly initialised neck and
+    head. Layer indices 0-10 are kept: layer 0 = ZipDepthBackbone, layers 4 / 6 / 10 pick P3 / P4 / P5 from it,
+    the rest are placeholders.
     """
     model = DetectionModel("yolo26n.yaml", nc=nc, verbose=False)
     model.names = names
@@ -87,7 +103,7 @@ def build_zipdepth_yolo(nc, names, zipdepth_ckpt=None, coco_weights="yolo26n.pt"
         from ultralytics import YOLO
         model.load(YOLO(coco_weights).model, verbose=verbose)
     layers = list(model.model)
-    layers[0] = _set_meta(ZipDepthBackbone(zipdepth_ckpt), 0, -1)
+    layers[0] = _set_meta(ZipDepthBackbone(zipdepth_ckpt, adapter_layers=adapter_layers), 0, -1)
     for i in REPLACED[1:]:
         layers[i] = _set_meta(PassThrough(), i, -1)
     layers[4] = _set_meta(Pick(0), 4, 0)
@@ -95,18 +111,23 @@ def build_zipdepth_yolo(nc, names, zipdepth_ckpt=None, coco_weights="yolo26n.pt"
     layers[10] = _set_meta(Pick(2), 10, 0)
     model.model = nn.Sequential(*layers)
     model.save = sorted(set(model.save) | {0})                     # keep layer 0's output for layers 4 / 6 / 10
-    model.yaml["backbone_override"] = "ZipDepth-base encoder" + (" (pretrained)" if zipdepth_ckpt else " (random)")
+    model.yaml["backbone_override"] = (f"ZipDepth-base encoder ({'pretrained' if zipdepth_ckpt else 'random'}), "
+                                       f"{adapter_layers}-layer adapters, neck/head {'COCO' if coco_weights else 'random'}")
     return model
 
 
 class ZipDepthTrainer(DetectionTrainer):
-    """DetectionTrainer that builds the ZipDepth model; on resume it restores weights from the checkpoint model."""
+    """DetectionTrainer that builds the ZipDepth model; on resume it restores weights from the checkpoint model.
+    Set the class attributes before training."""
 
-    zipdepth_ckpt = None                                             # set before training (None = random encoder)
+    zipdepth_ckpt = None                                             # None = random encoder
+    adapter_layers = 1                                               # 1 = Run B, 3 = Run B-A3
+    coco_neck_head = True                                            # False = random neck and head (Run B-RN)
 
     def get_model(self, cfg=None, weights=None, verbose=True):
-        model = build_zipdepth_yolo(self.data["nc"], self.data["names"], self.zipdepth_ckpt,
-                                    coco_weights=None if weights is not None else "yolo26n.pt", verbose=verbose)
+        coco = "yolo26n.pt" if (weights is None and self.coco_neck_head) else None
+        model = build_zipdepth_yolo(self.data["nc"], self.data["names"], self.zipdepth_ckpt, coco_weights=coco,
+                                    adapter_layers=self.adapter_layers, verbose=verbose)
         if weights is not None:                                      # resume / fine-tune from a saved run
             model.load_state_dict(weights.float().state_dict())
         return model
